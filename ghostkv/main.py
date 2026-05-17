@@ -56,6 +56,73 @@ def build_agent(args: argparse.Namespace) -> GhostKVAgent:
     )
     memory = MemoryTool()
 
+    if args.hybrid:
+        # Hybrid mode — local model for ReAct + remote for final synthesis
+        if not args.remote or not (args.remote_key or os.environ.get("GHOSTKV_API_KEY")):
+            print("Error: --hybrid requires --remote and --remote-key (or GHOSTKV_API_KEY env var)")
+            sys.exit(1)
+
+        # Load local model
+        print(f"Loading local model from {args.model}...")
+        model = TransformersBackend(
+            model_path=args.model,
+            quantize_4bit=not args.no_quantize,
+        )
+        print(f"Local model ready. head_dim={model.head_dim}, device={model.device}")
+
+        # Create KVSession
+        session = KVSession(
+            name=args.session,
+            model_name=Path(args.model).name,
+            head_dim=model.head_dim,
+            kv_bits=args.kv_bits,
+        )
+        loaded = session.load(device=model.device)
+        if loaded:
+            print(f"Session '{args.session}' restored: {session.kv_seq_length()} KV tokens, "
+                  f"{session.steps} steps")
+        else:
+            print(f"New session: {args.session}")
+
+        if args.symmetric_ttq:
+            session.ensure_rotation(model.device)
+            installed = model.install_symmetric_ttq(
+                rotation=session.rotation,
+                k_bits=args.kv_bits,
+                v_bits=args.kv_bits,
+                q_bits=args.query_bits,
+            )
+            if installed:
+                print(f"Symmetric TTQ active: K={args.kv_bits}b V={args.kv_bits}b Q={args.query_bits}b")
+
+        # Create remote backend
+        api_key = args.remote_key or os.environ.get("GHOSTKV_API_KEY", "")
+        remote = RemoteBackend(
+            base_url=args.remote,
+            api_key=api_key,
+            model=args.remote_model,
+            timeout=args.remote_timeout,
+        )
+
+        session.remote_tokens = 0
+        session.remote_calls = 0
+
+        agent = GhostKVAgent(
+            model=model,
+            session=session,
+            tools=tools,
+            memory=memory,
+            remote_backend=remote,
+            max_new_tokens=args.max_tokens,
+            max_steps=args.max_steps,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p,
+        )
+
+        print(f"Hybrid mode: local={Path(args.model).name} + remote={args.remote_model} @ {args.remote}")
+        return agent
+
     if args.remote:
         # Remote mode — no GPU, no local model
         api_key = args.remote_key or os.environ.get("GHOSTKV_API_KEY", "")
@@ -169,6 +236,8 @@ def cmd_stats(session):
             print(f"  KV disk: {compressed:,} bytes ({compressed/1024:.1f} KB)")
     if 'messages' in stats:
         print(f"  Messages: {stats['messages']}")
+    if stats.get('remote_calls', 0) > 0:
+        print(f"  Remote:   {stats['remote_calls']} calls, {stats['remote_tokens']} tokens")
     print()
 
 
@@ -263,8 +332,11 @@ def repl(agent: GhostKVAgent):
                 if hasattr(session, 'kv_seq_length'):
                     kv_tokens = session.kv_seq_length()
                     compressed_size = session.kv_size_bytes()
+                    remote_info = ""
+                    if hasattr(session, 'remote_calls') and session.remote_calls > 0:
+                        remote_info = f" | Remote: {session.remote_calls} calls"
                     print(f"  Steps: {session.steps} | Tokens: {step_tokens} | "
-                          f"KV: {kv_tokens} tokens ({compressed_size/1024:.1f} KB)")
+                          f"KV: {kv_tokens} tokens ({compressed_size/1024:.1f} KB){remote_info}")
                 else:
                     print(f"  Steps: {session.steps} | Tokens: {step_tokens} | "
                           f"Messages: {len(session.messages)}")
@@ -316,6 +388,8 @@ def main():
                         help="Remote model name (default: glm-5.1)")
     parser.add_argument("--remote-timeout", type=int, default=120,
                         help="Remote API request timeout in seconds (default: 120)")
+    parser.add_argument("--hybrid", action="store_true",
+                        help="Hybrid mode: local model for ReAct + remote for final synthesis")
     args = parser.parse_args()
 
     logging.basicConfig(level=getattr(logging, args.log_level), format="%(name)s: %(message)s")

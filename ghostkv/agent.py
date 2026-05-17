@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -29,6 +30,21 @@ from ghostkv.tools.files import FileReadTool, FileWriteTool
 from ghostkv.tools.http import HttpTool
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Tool history tracking (for hybrid escalation)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ToolHistoryEntry:
+    """Record of a single tool call during a ReAct loop."""
+    step: int
+    thought: str
+    tool_name: str
+    tool_args: str
+    result: str
+
 
 # ---------------------------------------------------------------------------
 # Tool dispatch
@@ -241,6 +257,15 @@ class GhostKVAgent:
         self.memory = memory
         self.remote_backend = remote_backend
         self.max_new_tokens = max_new_tokens
+        self._tool_history: list[ToolHistoryEntry] = []
+
+        # Determine operating mode
+        if model is not None and remote_backend is not None:
+            self._mode = "hybrid"
+        elif remote_backend is not None:
+            self._mode = "remote"
+        else:
+            self._mode = "local"
         self.max_steps = max_steps
         self.auto_save_steps = auto_save_steps
         self.temperature = temperature
@@ -276,7 +301,7 @@ class GhostKVAgent:
         Returns:
             (response_text, n_tokens_used)
         """
-        if self.remote_backend is not None:
+        if self._mode == "remote":
             # Remote path — build message history
             if is_observation:
                 self.session.add_message("assistant", "Using tool...")
@@ -351,6 +376,20 @@ class GhostKVAgent:
         # Check for tool calls and loop
         answer = self._react_loop(response, max_steps=self.max_steps - 1)
 
+        # Hybrid escalation: synthesize final answer via remote
+        if self._mode == "hybrid":
+            try:
+                remote_answer, remote_tokens = self._escalate_to_remote(
+                    question, self._tool_history, answer
+                )
+                if hasattr(self.session, 'remote_tokens'):
+                    self.session.remote_tokens += remote_tokens
+                    self.session.remote_calls += 1
+                self._ingest_into_kv(remote_answer)
+                answer = remote_answer
+            except Exception:
+                logger.warning("Remote escalation failed, using local draft", exc_info=True)
+
         # Write observations to memory
         self._save_to_memory(question, answer)
 
@@ -365,6 +404,7 @@ class GhostKVAgent:
 
         Parses tool calls, executes them, feeds observations back.
         """
+        self._tool_history.clear()
         current_response = initial_response
 
         for step in range(max_steps):
@@ -386,6 +426,16 @@ class GhostKVAgent:
                 self.session.log(f"Answer: {answer[:200]}")
                 return answer
 
+            # Track in tool history
+            tool_args = action_match.group(2) if action_match.group(2) else ""
+            self._tool_history.append(ToolHistoryEntry(
+                step=step + 1,
+                thought=current_response[:200],
+                tool_name=tool_name,
+                tool_args=tool_args,
+                result=(result or "")[:200],
+            ))
+
             self.session.log(f"  Tool: {tool_name}")
             self.session.log(f"  Result: {result[:200]}")
 
@@ -399,6 +449,77 @@ class GhostKVAgent:
             self.session.log(f"Step {self.session.steps} ({n_tokens} tokens): {current_response[:200]}")
 
         return current_response.strip()
+
+    def _build_synthesis_prompt(
+        self,
+        question: str,
+        tool_history: list[ToolHistoryEntry],
+        local_draft: str,
+    ) -> list[dict]:
+        """Build message list for remote synthesis call."""
+        research_steps = []
+        for entry in tool_history:
+            research_steps.append(
+                f"Step {entry.step}: Used {entry.tool_name}({entry.tool_args})\n"
+                f"Result: {entry.result[:1000]}"
+            )
+        research_block = "\n\n".join(research_steps) if research_steps else "No tools used."
+
+        user_content = (
+            f"## Original Question\n{question}\n\n"
+            f"## Research Steps\n{research_block}\n\n"
+            f"## Local Draft Answer\n{local_draft}\n\n"
+            f"## Instructions\n"
+            f"Synthesize a polished, accurate final answer from the research above. "
+            f"Use all available information from the research steps. "
+            f"Be concise and direct."
+        )
+        return [
+            {"role": "system", "content": "You are a helpful research assistant. Synthesize a final answer from the provided research."},
+            {"role": "user", "content": user_content},
+        ]
+
+    def _escalate_to_remote(
+        self,
+        question: str,
+        tool_history: list[ToolHistoryEntry],
+        local_draft: str,
+    ) -> tuple[str, int]:
+        """Send synthesis request to remote backend.
+
+        Returns (answer, remote_tokens). Falls back to local_draft on failure.
+        """
+        messages = self._build_synthesis_prompt(question, tool_history, local_draft)
+        text, usage = self.remote_backend.generate(
+            messages=messages,
+            temperature=0.5,
+            max_tokens=self.max_new_tokens * 2,
+        )
+        remote_tokens = usage.get("total_tokens", len(text.split()))
+        return text, remote_tokens
+
+    def _ingest_into_kv(self, text: str) -> None:
+        """Feed remote answer into local KV cache for context continuity.
+
+        Runs a minimal generate_step (temp=0, max_new=1) purely for the
+        KV side effect — the model absorbs the text into cache.
+        """
+        if self.model is None or not hasattr(self.session, 'cache'):
+            return
+        ingest_text = f"Synthesized Answer: {text}"
+        input_ids = self.model.tokenize(ingest_text)
+        n_tokens = input_ids.shape[1]
+        self.session.token_costs.append(n_tokens)
+        self.session.total_tokens += n_tokens
+
+        past_kv = self.session.cache
+        _, new_kv = generate_step(
+            self.model, input_ids,
+            past_kv=past_kv,
+            max_new=1,
+            temperature=0,
+        )
+        self.session.cache = new_kv
 
     def _recall_memories(self, question: str) -> list[str]:
         """Search the vault for memories relevant to the question."""

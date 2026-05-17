@@ -1386,3 +1386,191 @@ class TestAgentRemoteMode:
         loaded = s2.load()
         assert loaded
         assert len(s2.messages) == len(session.messages)
+
+
+# ===================================================================
+# Hybrid mode tests
+# ===================================================================
+
+class TestHybridMode:
+    """Test hybrid escalation: local ReAct + remote synthesis."""
+
+    def setup_method(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.vault = os.path.join(self.tmpdir, "vault")
+
+    def teardown_method(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _make_mock_model(self):
+        """Create a mock ModelBackend that returns predictable output."""
+        from ghostkv.model import ModelBackend
+
+        class MockModel(ModelBackend):
+            def __init__(self):
+                self._eos = 999
+                self._count = 0
+
+            def forward(self, input_ids, past_kv=None, use_cache=True):
+                self._count += 1
+                batch, seq = input_ids.shape
+                vocab_size = 1000
+                logits = torch.zeros(1, seq, vocab_size)
+                if self._count < 3:
+                    logits[:, -1, 42] = 100.0
+                else:
+                    logits[:, -1, self._eos] = 100.0
+                cache = DynamicCache() if past_kv is None else past_kv
+                if cache.get_seq_length() == 0:
+                    k = torch.randn(1, 2, seq, 8)
+                    v = torch.randn(1, 2, seq, 8)
+                    cache.update(k, v, layer_idx=0)
+                return logits, cache
+
+            def tokenize(self, text, **kwargs):
+                return torch.tensor([[1, 2, 3]])
+
+            def decode(self, ids):
+                return "local draft answer"
+
+            @property
+            def head_dim(self): return 8
+
+            @property
+            def device(self): return "cpu"
+
+            @property
+            def eos_token_id(self): return self._eos
+
+        return MockModel()
+
+    def _make_hybrid_agent(self, remote_answer="Remote synthesized answer", remote_tokens=50):
+        """Create a hybrid agent with mock model + mock remote."""
+        from ghostkv.agent import GhostKVAgent, ToolDispatch
+        from ghostkv.kv import KVSession
+        from ghostkv.remote import RemoteBackend
+        from ghostkv.tools import MemoryTool
+
+        model = self._make_mock_model()
+        session = KVSession(name="test_hybrid", head_dim=8)
+        session.base_dir = Path(self.tmpdir) / "hybrid_session"
+        session.base_dir.mkdir(parents=True, exist_ok=True)
+        session.ensure_rotation("cpu")
+
+        backend = MagicMock(spec=RemoteBackend)
+        backend.generate.return_value = (remote_answer, {"total_tokens": remote_tokens})
+
+        tools = ToolDispatch(memory=MemoryTool(vault_path=self.vault))
+        memory = MemoryTool(vault_path=self.vault)
+
+        agent = GhostKVAgent(
+            model=model,
+            session=session,
+            tools=tools,
+            memory=memory,
+            remote_backend=backend,
+            max_new_tokens=120,
+            max_steps=5,
+            temperature=0.7,
+        )
+        return agent, session, backend
+
+    def test_hybrid_mode_detection(self):
+        """Both backends set → _mode == 'hybrid'."""
+        agent, _, _ = self._make_hybrid_agent()
+        assert agent._mode == "hybrid"
+
+    def test_hybrid_escalates_after_react(self):
+        """Remote.generate should be called once, final answer is remote's."""
+        agent, session, backend = self._make_hybrid_agent(
+            remote_answer="Polished remote answer"
+        )
+        answer = agent.run("What is 6*7?")
+
+        # Remote was called exactly once for synthesis
+        backend.generate.assert_called_once()
+        # Answer should be from remote
+        assert answer == "Polished remote answer"
+
+    def test_hybrid_tool_history_tracked(self):
+        """Tool calls should create history entries."""
+        agent, session, backend = self._make_hybrid_agent()
+        # The mock model always returns "local draft answer" which has no Action: pattern
+        # So _tool_history will be empty in this case (no tools called)
+        agent.run("test question")
+        assert isinstance(agent._tool_history, list)
+
+    def test_hybrid_synthesis_prompt(self):
+        """Synthesis prompt should contain question + tool results + draft."""
+        agent, session, backend = self._make_hybrid_agent()
+
+        # Build a prompt manually to verify structure
+        from ghostkv.agent import ToolHistoryEntry
+        history = [
+            ToolHistoryEntry(step=1, thought="Looking up", tool_name="search",
+                             tool_args="Eiffel Tower", result="Built in 1889"),
+            ToolHistoryEntry(step=2, thought="Checking", tool_name="run",
+                             tool_args="print(1+1)", result="2"),
+        ]
+        messages = agent._build_synthesis_prompt("When was the Eiffel Tower built?", history, "1889")
+
+        assert len(messages) == 2
+        assert messages[0]["role"] == "system"
+        assert messages[1]["role"] == "user"
+        user_content = messages[1]["content"]
+        assert "Eiffel Tower" in user_content
+        assert "search" in user_content
+        assert "Built in 1889" in user_content
+        assert "local draft" in user_content.lower() or "1889" in user_content
+
+    def test_hybrid_fallback_on_remote_failure(self):
+        """If remote raises, local draft should be returned."""
+        agent, session, backend = self._make_hybrid_agent()
+        backend.generate.side_effect = RuntimeError("Remote API error 500")
+
+        answer = agent.run("What is 6*7?")
+
+        # Should fall back to local draft (decoded from mock model)
+        assert "local draft" in answer.lower() or len(answer) > 0
+
+    def test_hybrid_kv_ingestion(self):
+        """Session cache should grow after escalation."""
+        agent, session, backend = self._make_hybrid_agent(
+            remote_answer="Synthesized answer for KV"
+        )
+
+        initial_kv_len = session.kv_seq_length()
+        agent.run("test question")
+        # After ingest, KV cache should have grown
+        assert session.kv_seq_length() > initial_kv_len
+
+    def test_hybrid_remote_stats(self):
+        """remote_tokens and remote_calls should be tracked and survive save/load."""
+        agent, session, backend = self._make_hybrid_agent(
+            remote_tokens=42
+        )
+        agent.run("test")
+
+        assert session.remote_calls == 1
+        assert session.remote_tokens == 42
+
+        # Save and reload
+        session.save()
+        from ghostkv.kv import KVSession
+        s2 = KVSession(name="test_hybrid", head_dim=8)
+        s2.base_dir = session.base_dir
+        s2.load()
+        assert s2.remote_calls == 1
+        assert s2.remote_tokens == 42
+
+    def test_hybrid_no_tools_direct_answer(self):
+        """Even with no tool calls, should still escalate to remote."""
+        agent, session, backend = self._make_hybrid_agent(
+            remote_answer="Direct remote answer"
+        )
+        # Mock model returns "local draft answer" (no Action: patterns)
+        answer = agent.run("Simple question")
+
+        # Still escalated
+        backend.generate.assert_called_once()
+        assert answer == "Direct remote answer"

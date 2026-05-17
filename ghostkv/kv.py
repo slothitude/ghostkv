@@ -207,6 +207,8 @@ class KVSession:
         self.total_tokens: int = 0
         self.token_costs: list[int] = []
         self._log_lines: list[str] = []
+        self.remote_tokens: int = 0
+        self.remote_calls: int = 0
 
     @property
     def kv_cache_path(self) -> Path:
@@ -236,6 +238,8 @@ class KVSession:
             "steps": self.steps,
             "total_tokens": self.total_tokens,
             "token_costs": self.token_costs,
+            "remote_tokens": self.remote_tokens,
+            "remote_calls": self.remote_calls,
         }
         self.metadata_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
@@ -268,6 +272,8 @@ class KVSession:
         self.steps = meta.get("steps", 0)
         self.total_tokens = meta.get("total_tokens", 0)
         self.token_costs = meta.get("token_costs", [])
+        self.remote_tokens = meta.get("remote_tokens", 0)
+        self.remote_calls = meta.get("remote_calls", 0)
 
         has_kv = False
         if self.kv_cache_path.exists():
@@ -286,6 +292,8 @@ class KVSession:
         self.steps = 0
         self.total_tokens = 0
         self.token_costs = []
+        self.remote_tokens = 0
+        self.remote_calls = 0
         self._log_lines.clear()
         logger.info("Session reset.")
 
@@ -325,4 +333,6 @@ class KVSession:
             "kv_tokens": self.kv_seq_length(),
             "kv_bytes": kv_bytes,
             "kv_compressed_size": len(serialize_kv(self.cache)) if self.cache is not None else 0,
+            "remote_tokens": self.remote_tokens,
+            "remote_calls": self.remote_calls,
         }
