@@ -28,6 +28,7 @@ from ghostkv.remote import RemoteBackend, MessageSession
 from ghostkv.tools import (
     SearchTool,
     CodeTool,
+    BashTool,
     FileReadTool,
     FileWriteTool,
     HttpTool,
@@ -47,6 +48,7 @@ def build_agent(args: argparse.Namespace) -> GhostKVAgent:
     tools = ToolDispatch(
         search=SearchTool() if not args.no_search else None,
         code=CodeTool(timeout=args.code_timeout),
+        bash=BashTool(timeout=args.code_timeout),
         file_read=FileReadTool(),
         file_write=FileWriteTool(),
         http=HttpTool(),

@@ -427,6 +427,56 @@ class TestCodeTool:
         assert "no output" in result.lower()
 
 
+class TestBashTool:
+    """Test bash command execution."""
+
+    def test_simple_echo(self):
+        from ghostkv.tools.bash import BashTool
+        b = BashTool(timeout=5)
+        result = b.run("echo hello world")
+        assert "hello world" in result
+
+    def test_pipe_and_redirect(self):
+        from ghostkv.tools.bash import BashTool
+        b = BashTool(timeout=5)
+        result = b.run("echo 'foo bar baz' | tr ' ' '\\n' | sort")
+        assert "bar" in result
+        assert "baz" in result
+        assert "foo" in result
+
+    def test_exit_code(self):
+        from ghostkv.tools.bash import BashTool
+        b = BashTool(timeout=5)
+        result = b.run("exit 1")
+        assert "exit code" in result.lower()
+
+    def test_stderr_captured(self):
+        from ghostkv.tools.bash import BashTool
+        b = BashTool(timeout=5)
+        result = b.run("echo error >&2")
+        assert "error" in result
+
+    def test_timeout(self):
+        from ghostkv.tools.bash import BashTool
+        b = BashTool(timeout=1)
+        result = b.run("sleep 10")
+        assert "timeout" in result.lower()
+
+    def test_no_output(self):
+        from ghostkv.tools.bash import BashTool
+        b = BashTool(timeout=5)
+        result = b.run("true")
+        assert "no output" in result.lower()
+
+    def test_dispatch_bash(self):
+        from ghostkv.agent import ToolDispatch
+        from ghostkv.tools.bash import BashTool
+        tools = ToolDispatch(bash=BashTool(timeout=5))
+        name, result = tools.dispatch('Action: bash("echo dispatched")')
+        assert name == "bash"
+        assert "dispatched" in result
+
+
 class TestFileTools:
     """Test file read/write tools."""
 

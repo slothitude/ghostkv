@@ -24,6 +24,7 @@ from ghostkv.remote import RemoteBackend, MessageSession
 from ghostkv.tools.memory import MemoryTool
 from ghostkv.tools.search import SearchTool
 from ghostkv.tools.code import CodeTool
+from ghostkv.tools.bash import BashTool
 from ghostkv.tools.files import FileReadTool, FileWriteTool
 from ghostkv.tools.http import HttpTool
 
@@ -48,6 +49,7 @@ class ToolDispatch:
         self,
         search: SearchTool | None = None,
         code: CodeTool | None = None,
+        bash: BashTool | None = None,
         file_read: FileReadTool | None = None,
         file_write: FileWriteTool | None = None,
         http: HttpTool | None = None,
@@ -58,6 +60,8 @@ class ToolDispatch:
             self._tools["search"] = search
         if code:
             self._tools["run"] = code
+        if bash:
+            self._tools["bash"] = bash
         if file_read:
             self._tools["read"] = file_read
         if file_write:
@@ -95,6 +99,8 @@ class ToolDispatch:
             if tool_name == "search":
                 result = tool.run(arg1)
             elif tool_name == "run":
+                result = tool.run(arg1)
+            elif tool_name == "bash":
                 result = tool.run(arg1)
             elif tool_name == "read":
                 result = tool.run(arg1)
