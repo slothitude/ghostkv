@@ -16,6 +16,10 @@ import os
 import sys
 from pathlib import Path
 
+# Windows cp1252 console can't handle emoji from remote API responses
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 from ghostkv import __version__
 from ghostkv.agent import GhostKVAgent, ToolDispatch
 from ghostkv.kv import KVSession
