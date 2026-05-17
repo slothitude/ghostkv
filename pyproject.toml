@@ -4,7 +4,7 @@ build-backend = "setuptools.backends._legacy:_Backend"
 
 [project]
 name = "ghostkv"
-version = "0.2.0"
+version = "0.3.0"
 description = "Memory that haunts, not repeats — an agent CLI with compressed KV memory as persistent brain"
 readme = "README.md"
 license = "MIT"

@@ -20,6 +20,7 @@ from jinja2 import Environment, FileSystemLoader
 
 from ghostkv.kv import KVSession
 from ghostkv.model import ModelBackend
+from ghostkv.remote import RemoteBackend, MessageSession
 from ghostkv.tools.memory import MemoryTool
 from ghostkv.tools.search import SearchTool
 from ghostkv.tools.code import CodeTool
@@ -216,10 +217,11 @@ class GhostKVAgent:
 
     def __init__(
         self,
-        model: ModelBackend,
-        session: KVSession,
-        tools: ToolDispatch,
-        memory: MemoryTool,
+        model: ModelBackend | None = None,
+        session: KVSession | MessageSession | None = None,
+        tools: ToolDispatch | None = None,
+        memory: MemoryTool | None = None,
+        remote_backend: RemoteBackend | None = None,
         max_new_tokens: int = 120,
         max_steps: int = 10,
         auto_save_steps: int = 5,
@@ -231,6 +233,7 @@ class GhostKVAgent:
         self.session = session
         self.tools = tools
         self.memory = memory
+        self.remote_backend = remote_backend
         self.max_new_tokens = max_new_tokens
         self.max_steps = max_steps
         self.auto_save_steps = auto_save_steps
@@ -246,8 +249,9 @@ class GhostKVAgent:
         self.error_template = self.jinja.get_template("error.j2")
         self.memory_template = self.jinja.get_template("memory.j2")
 
-        # Ensure session rotation is initialized
-        self.session.ensure_rotation(self.model.device)
+        # Ensure session rotation is initialized (local mode only)
+        if self.model is not None and hasattr(self.session, 'ensure_rotation'):
+            self.session.ensure_rotation(self.model.device)
 
     def _build_initial_prompt(self, question: str) -> str:
         """Build the first prompt with system instructions + question."""
@@ -255,6 +259,63 @@ class GhostKVAgent:
             tools=", ".join(self.tools.available_tools())
         )
         return f"{system}\n\nQuestion: {question}\n"
+
+    def _generate_response(self, prompt_text: str, is_observation: bool = False) -> tuple[str, int]:
+        """Generate a response, branching on local vs remote backend.
+
+        Args:
+            prompt_text: Text to feed to the model (new tokens for local, message for remote).
+            is_observation: If True, prompt_text is an observation (not the initial question).
+
+        Returns:
+            (response_text, n_tokens_used)
+        """
+        if self.remote_backend is not None:
+            # Remote path — build message history
+            if is_observation:
+                self.session.add_message("assistant", "Using tool...")
+                self.session.add_message("user", prompt_text)
+            else:
+                # Initial question — add system + user messages
+                self.session.add_message("user", prompt_text)
+
+            text, usage = self.remote_backend.generate(
+                messages=self.session.messages,
+                temperature=self.temperature,
+                max_tokens=self.max_new_tokens,
+            )
+            n_tokens = usage.get("total_tokens", len(text.split()))
+
+            # Track assistant response in message history
+            self.session.add_message("assistant", text)
+            self.session.token_costs.append(n_tokens)
+            self.session.total_tokens += n_tokens
+            self.session.steps += 1
+
+            return text, n_tokens
+        else:
+            # Local path — tokenize + generate_step + decode
+            input_ids = self.model.tokenize(prompt_text)
+            n_tokens = input_ids.shape[1]
+            self.session.token_costs.append(n_tokens)
+            self.session.total_tokens += n_tokens
+
+            past_kv = self.session.cache if hasattr(self.session, 'cache') else None
+            gen_ids, new_kv = generate_step(
+                self.model, input_ids,
+                past_kv=past_kv,
+                max_new=self.max_new_tokens,
+                temperature=self.temperature,
+                top_k=self.top_k,
+                top_p=self.top_p,
+            )
+            response = self.model.decode(gen_ids)
+
+            if hasattr(self.session, 'cache'):
+                self.session.cache = new_kv
+            self.session.steps += 1
+
+            return response, n_tokens
 
     def run(self, question: str) -> str:
         """Run the full agent loop on a question.
@@ -276,26 +337,8 @@ class GhostKVAgent:
         self.session.log(f"Q: {question}")
         self.session.log(f"{'='*60}")
 
-        # First forward pass — tokenize full prompt
-        input_ids = self.model.tokenize(prompt)
-        n_tokens = input_ids.shape[1]
-        self.session.token_costs.append(n_tokens)
-        self.session.total_tokens += n_tokens
-
-        # Generate
-        gen_ids, new_kv = generate_step(
-            self.model, input_ids,
-            past_kv=self.session.cache,
-            max_new=self.max_new_tokens,
-            temperature=self.temperature,
-            top_k=self.top_k,
-            top_p=self.top_p,
-        )
-        response = self.model.decode(gen_ids)
-
-        # Update KV state
-        self.session.cache = new_kv
-        self.session.steps += 1
+        # Generate first response
+        response, n_tokens = self._generate_response(prompt, is_observation=False)
 
         self.session.log(f"Step 1 ({n_tokens} tokens): {response[:200]}")
 
@@ -343,25 +386,10 @@ class GhostKVAgent:
             # Format observation
             observation = self.observe_template.render(result=result[:2000])
 
-            # Feed observation as new tokens (past is in KV cache)
-            obs_ids = self.model.tokenize(observation)
-            n_tokens = obs_ids.shape[1]
-            self.session.token_costs.append(n_tokens)
-            self.session.total_tokens += n_tokens
-
-            gen_ids, new_kv = generate_step(
-                self.model, obs_ids,
-                past_kv=self.session.cache,
-                max_new=self.max_new_tokens,
-                temperature=self.temperature,
-                top_k=self.top_k,
-                top_p=self.top_p,
+            # Generate next response from observation
+            current_response, n_tokens = self._generate_response(
+                observation, is_observation=True
             )
-
-            self.session.cache = new_kv
-            self.session.steps += 1
-
-            current_response = self.model.decode(gen_ids)
             self.session.log(f"Step {self.session.steps} ({n_tokens} tokens): {current_response[:200]}")
 
         return current_response.strip()

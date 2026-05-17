@@ -5,6 +5,7 @@ Tests all components without requiring a GPU or model:
 - tools/: search, code, files, http, memory
 - agent.py: tool dispatch, regex parsing, ReAct loop logic
 - model.py: abstract interface (no instantiation test — needs GPU)
+- remote.py: RemoteBackend, MessageSession, agent remote mode
 """
 
 import json
@@ -12,6 +13,7 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
+from unittest.mock import patch, MagicMock
 
 import pytest
 import torch
@@ -1037,3 +1039,300 @@ class TestIntegration:
 
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ===================================================================
+# Remote backend tests
+# ===================================================================
+
+class TestRemoteBackend:
+    """Test RemoteBackend — mock requests.post."""
+
+    def _mock_response(self, status_code=200, content="Hello!", usage=None):
+        """Create a mock requests.Response."""
+        resp = MagicMock()
+        resp.status_code = status_code
+        resp.text = content
+        resp.json.return_value = {
+            "choices": [{"message": {"content": content}}],
+            "usage": usage or {"total_tokens": 50, "prompt_tokens": 30, "completion_tokens": 20},
+        }
+        return resp
+
+    def test_generate_success(self):
+        """Basic generate returns (text, usage)."""
+        from ghostkv.remote import RemoteBackend
+        backend = RemoteBackend(
+            base_url="https://api.test.com/v1/chat/completions",
+            api_key="test-key",
+            model="test-model",
+        )
+        mock_resp = self._mock_response(content="Test response", usage={"total_tokens": 42})
+
+        with patch("ghostkv.remote.requests.post", return_value=mock_resp) as mock_post:
+            text, usage = backend.generate(
+                messages=[{"role": "user", "content": "Hello"}],
+                temperature=0.7,
+                max_tokens=100,
+            )
+
+        assert text == "Test response"
+        assert usage["total_tokens"] == 42
+        mock_post.assert_called_once()
+
+        # Verify request format
+        call_kwargs = mock_post.call_args
+        payload = call_kwargs.kwargs["json"]
+        assert payload["model"] == "test-model"
+        assert payload["temperature"] == 0.7
+        assert payload["max_tokens"] == 100
+        assert payload["messages"] == [{"role": "user", "content": "Hello"}]
+
+        headers = call_kwargs.kwargs["headers"]
+        assert headers["Authorization"] == "Bearer test-key"
+
+    def test_generate_request_format(self):
+        """Verify messages are sent correctly."""
+        from ghostkv.remote import RemoteBackend
+        backend = RemoteBackend(base_url="https://api.test.com", api_key="k")
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Hi"},
+        ]
+        mock_resp = self._mock_response()
+        with patch("ghostkv.remote.requests.post", return_value=mock_resp) as mock_post:
+            backend.generate(messages=messages)
+
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["messages"] == messages
+
+    def test_generate_retry_on_429(self):
+        """Should retry on 429 with backoff."""
+        from ghostkv.remote import RemoteBackend
+        backend = RemoteBackend(base_url="https://api.test.com", api_key="k")
+
+        resp_429 = MagicMock()
+        resp_429.status_code = 429
+        resp_200 = self._mock_response(content="Success")
+
+        with patch("ghostkv.remote.requests.post", side_effect=[resp_429, resp_200]) as mock_post:
+            with patch("ghostkv.remote.time.sleep") as mock_sleep:
+                text, usage = backend.generate(messages=[{"role": "user", "content": "hi"}])
+
+        assert text == "Success"
+        assert mock_post.call_count == 2
+        mock_sleep.assert_called_once_with(10)  # first retry, 10s backoff
+
+    def test_generate_raises_on_non_200(self):
+        """Should raise RuntimeError on non-200 response."""
+        from ghostkv.remote import RemoteBackend
+        backend = RemoteBackend(base_url="https://api.test.com", api_key="k")
+
+        resp_500 = MagicMock()
+        resp_500.status_code = 500
+        resp_500.text = "Internal Server Error"
+
+        with patch("ghostkv.remote.requests.post", return_value=resp_500):
+            with pytest.raises(RuntimeError, match="Remote API error 500"):
+                backend.generate(messages=[{"role": "user", "content": "hi"}])
+
+    def test_generate_empty_usage(self):
+        """Should handle missing usage field gracefully."""
+        from ghostkv.remote import RemoteBackend
+        backend = RemoteBackend(base_url="https://api.test.com", api_key="k")
+
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "choices": [{"message": {"content": "ok"}}],
+            # no "usage" key
+        }
+
+        with patch("ghostkv.remote.requests.post", return_value=resp):
+            text, usage = backend.generate(messages=[{"role": "user", "content": "hi"}])
+
+        assert text == "ok"
+        assert usage == {}
+
+
+class TestMessageSession:
+    """Test MessageSession save/load/reset."""
+
+    def setup_method(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def teardown_method(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _make_session(self, name="test"):
+        from ghostkv.remote import MessageSession
+        s = MessageSession(name=name, model_name="test-model")
+        s.base_dir = Path(self.tmpdir) / name
+        s.base_dir.mkdir(parents=True, exist_ok=True)
+        return s
+
+    def test_new_session(self):
+        s = self._make_session()
+        assert len(s.messages) == 0
+        assert s.steps == 0
+        assert s.token_costs == []
+
+    def test_add_message(self):
+        s = self._make_session()
+        s.add_message("user", "Hello")
+        s.add_message("assistant", "Hi there")
+        assert len(s.messages) == 2
+        assert s.messages[0]["role"] == "user"
+        assert s.messages[1]["role"] == "assistant"
+
+    def test_save_and_load(self):
+        s = self._make_session("save_load")
+        s.add_message("user", "Test question")
+        s.add_message("assistant", "Test answer")
+        s.steps = 2
+        s.total_tokens = 50
+        s.token_costs = [25, 25]
+        s.save()
+
+        # Load into new session
+        s2 = self._make_session("save_load")
+        loaded = s2.load()
+        assert loaded is True
+        assert len(s2.messages) == 2
+        assert s2.messages[0]["content"] == "Test question"
+        assert s2.steps == 2
+        assert s2.total_tokens == 50
+        assert s2.token_costs == [25, 25]
+
+    def test_reset_clears_state(self):
+        s = self._make_session("reset_test")
+        s.add_message("user", "Hello")
+        s.steps = 5
+        s.total_tokens = 100
+        s.token_costs = [20, 20, 20, 20, 20]
+
+        s.reset()
+        assert len(s.messages) == 0
+        assert s.steps == 0
+        assert s.total_tokens == 0
+        assert s.token_costs == []
+
+    def test_load_nonexistent(self):
+        s = self._make_session("nonexistent")
+        loaded = s.load()
+        assert loaded is False
+
+    def test_stats(self):
+        s = self._make_session("stats_test")
+        s.steps = 3
+        s.total_tokens = 60
+        stats = s.stats()
+        assert stats["session"] == "stats_test"
+        assert stats["model"] == "test-model"
+        assert stats["mode"] == "remote"
+        assert stats["steps"] == 3
+        assert stats["messages"] == 0
+
+    def test_log_writes_to_file(self):
+        s = self._make_session("log_test")
+        s.log("Line 1")
+        s.log("Line 2")
+        s.save()
+
+        content = s.log_path.read_text()
+        assert "Line 1" in content
+        assert "Line 2" in content
+
+
+class TestAgentRemoteMode:
+    """Test GhostKVAgent with mock RemoteBackend."""
+
+    def setup_method(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.vault = os.path.join(self.tmpdir, "vault")
+
+    def teardown_method(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _make_remote_agent(self):
+        """Create an agent with a mock RemoteBackend and MessageSession."""
+        from ghostkv.agent import GhostKVAgent, ToolDispatch
+        from ghostkv.remote import RemoteBackend, MessageSession
+        from ghostkv.tools import MemoryTool
+
+        session = MessageSession(name="test_remote", model_name="test-model")
+        session.base_dir = Path(self.tmpdir) / "remote_session"
+        session.base_dir.mkdir(parents=True, exist_ok=True)
+
+        # Mock backend that returns a fixed response
+        backend = MagicMock(spec=RemoteBackend)
+        backend.generate.return_value = ("Final answer: 42", {"total_tokens": 30})
+
+        tools = ToolDispatch(memory=MemoryTool(vault_path=self.vault))
+        memory = MemoryTool(vault_path=self.vault)
+
+        agent = GhostKVAgent(
+            session=session,
+            tools=tools,
+            memory=memory,
+            remote_backend=backend,
+            max_new_tokens=120,
+            max_steps=5,
+            temperature=0.7,
+        )
+        return agent, session, backend
+
+    def test_remote_run_no_tools(self):
+        """Agent with remote backend should call generate and return answer."""
+        agent, session, backend = self._make_remote_agent()
+        answer = agent.run("What is 6*7?")
+
+        assert "42" in answer
+        assert backend.generate.call_count == 1  # no tools, single call
+
+        # Messages should have grown
+        msgs = session.messages
+        assert len(msgs) >= 2  # at least user + assistant
+        assert any(m["role"] == "user" for m in msgs)
+        assert any(m["role"] == "assistant" for m in msgs)
+
+    def test_remote_message_history_grows(self):
+        """Each run should add messages to the session."""
+        agent, session, backend = self._make_remote_agent()
+        session.add_message("system", "You are helpful.")  # pre-seed
+
+        backend.generate.return_value = ("Answer 1", {"total_tokens": 10})
+        agent.run("Question 1")
+        count_after_1 = len(session.messages)
+
+        backend.generate.return_value = ("Answer 2", {"total_tokens": 10})
+        agent.run("Question 2")
+        count_after_2 = len(session.messages)
+
+        assert count_after_2 > count_after_1
+
+    def test_remote_tracks_token_costs(self):
+        """Token costs from usage should be tracked."""
+        agent, session, backend = self._make_remote_agent()
+        backend.generate.return_value = ("Done", {"total_tokens": 42})
+
+        agent.run("test")
+
+        assert len(session.token_costs) >= 1
+        assert session.total_tokens > 0
+
+    def test_remote_session_persistence(self):
+        """Messages should survive save/load cycle."""
+        agent, session, backend = self._make_remote_agent()
+        backend.generate.return_value = ("Hello", {"total_tokens": 10})
+        agent.run("Hi")
+
+        session.save()
+
+        # Load into new session
+        from ghostkv.remote import MessageSession
+        s2 = MessageSession(name="test_remote", model_name="test-model")
+        s2.base_dir = session.base_dir
+        loaded = s2.load()
+        assert loaded
+        assert len(s2.messages) == len(session.messages)
