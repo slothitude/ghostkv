@@ -58,6 +58,20 @@ def build_agent(args: argparse.Namespace) -> GhostKVAgent:
     else:
         print(f"New session: {args.session}")
 
+    # Install symmetric TTQ if requested
+    if args.symmetric_ttq:
+        session.ensure_rotation(model.device)
+        installed = model.install_symmetric_ttq(
+            rotation=session.rotation,
+            k_bits=args.kv_bits,
+            v_bits=args.kv_bits,
+            q_bits=args.query_bits,
+        )
+        if installed:
+            print(f"Symmetric TTQ active: K={args.kv_bits}b V={args.kv_bits}b Q={args.query_bits}b")
+        else:
+            print("Warning: symmetric TTQ requested but no attention layers found")
+
     # Initialize tools
     tools = ToolDispatch(
         search=SearchTool() if not args.no_search else None,
@@ -76,6 +90,9 @@ def build_agent(args: argparse.Namespace) -> GhostKVAgent:
         memory=MemoryTool(),
         max_new_tokens=args.max_tokens,
         max_steps=args.max_steps,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        top_p=args.top_p,
     )
 
     return agent
@@ -212,6 +229,16 @@ def main():
                         help="Max agent ReAct steps per question")
     parser.add_argument("--kv-bits", type=int, default=3,
                         help="KV compression bits (default: 3)")
+    parser.add_argument("--temperature", type=float, default=0.8,
+                        help="Sampling temperature (default: 0.8, 0=greedy)")
+    parser.add_argument("--top-k", type=int, default=50,
+                        help="Top-k sampling (default: 50, 0=disabled)")
+    parser.add_argument("--top-p", type=float, default=0.9,
+                        help="Nucleus sampling threshold (default: 0.9, 1.0=disabled)")
+    parser.add_argument("--symmetric-ttq", action="store_true",
+                        help="Enable symmetric TTQ (compress Q/K/V in same rotation frame)")
+    parser.add_argument("--query-bits", type=int, default=4,
+                        help="Query quantization bits for symmetric TTQ (default: 4)")
     parser.add_argument("--code-timeout", type=int, default=30,
                         help="Code execution timeout in seconds")
     parser.add_argument("--log-level", default="WARNING",

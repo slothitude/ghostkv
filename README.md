@@ -28,6 +28,7 @@ Step 50: 16 tokens  (still constant — KV grows, token cost doesn't)
 │         Agent Core                  │
 │  - ReAct loop (think → act → obs)  │
 │  - KV-state management (DynamicCache) │
+│  - Sampling (temperature/top-k/top-p) │
 │  - Tool dispatch                    │
 │  - Jinja prompt templates           │
 │  - Session persistence              │
@@ -49,6 +50,7 @@ Step 50: 16 tokens  (still constant — KV grows, token cost doesn't)
 │  Abstract: transformers / GGUF      │
 │  DynamicCache for KV state          │
 │  TTQ compression (rotate→quant→deq) │
+│  Symmetric TTQ (Q/K/V same frame)  │
 │  Serialize/deserialize to disk      │
 └─────────────────────────────────────┘
 ```
@@ -103,6 +105,27 @@ Located in [[Paris]], [[France]].
 - `[[wikilinks]]` create graph edges — open the vault in Obsidian to see the graph
 - The vault is human-browsable — the agent's memory is inspectable
 
+## Sampling
+
+Token generation uses temperature-scaled multinomial sampling with top-k and nucleus (top-p) filtering — not greedy argmax. This produces varied, non-repetitive responses and prevents the agent from getting stuck in loops.
+
+```
+Temperature 0.0  → greedy (deterministic, same as argmax)
+Temperature 0.8  → focused but varied (default)
+Temperature 1.5+ → creative/divergent
+Top-k 50         → only sample from 50 most likely tokens
+Top-p 0.9        → nucleus sampling (smallest set with ≥90% cumulative probability)
+```
+
+## Symmetric TTQ
+
+Optional inline compression that applies rotate→quantize→derotate to **all three** attention projections (Q, K, V) in the same coordinate frame during the forward pass. When Q and K share the same rotation, quantization noise becomes symmetric in the dot product Q·K^T and partially cancels.
+
+Standard TTQ (post-hoc): compress K/V only, after generation.
+Symmetric TTQ (inline): compress Q/K/V during generation, same rotation.
+
+Enabled with `--symmetric-ttq`. Proven in ResolutionRouter Stage 7e: PPL 7.76 (symmetric) vs 7.92 (standard TTQ) — noise cancellation is real.
+
 ## KV Persistence
 
 Sessions serialize to `~/.ghostkv/sessions/<name>/`:
@@ -123,7 +146,7 @@ Sessions serialize to `~/.ghostkv/sessions/<name>/`:
 
 ```
 $ python -m ghostkv.main --model /path/to/model
-GhostKV v0.1 — memory that haunts, not repeats
+GhostKV v0.2 — memory that haunts, not repeats
 model: qwen3-4b | session: default
 KV: 0 tokens (empty) | Memory: 0 files in vault
 
@@ -183,6 +206,11 @@ python -m ghostkv.main [OPTIONS]
   --max-tokens N        Max new tokens per generation step (default: 120)
   --max-steps N         Max agent ReAct steps per question (default: 10)
   --kv-bits N           KV compression bits (default: 3)
+  --temperature F       Sampling temperature (default: 0.8, 0 = greedy)
+  --top-k N             Top-k sampling (default: 50, 0 = disabled)
+  --top-p F             Nucleus sampling threshold (default: 0.9, 1.0 = disabled)
+  --symmetric-ttq       Enable symmetric TTQ (compress Q/K/V in same rotation frame)
+  --query-bits N        Query quantization bits for symmetric TTQ (default: 4)
   --code-timeout N      Code execution timeout in seconds (default: 30)
   --log-level LEVEL     Logging level (default: WARNING)
 ```
@@ -195,9 +223,9 @@ python -m ghostkv.main [OPTIONS]
 ghostkv/
   __init__.py              # Package root, version
   main.py                  # CLI REPL entry point
-  agent.py                 # ReAct agent loop + tool dispatch
-  model.py                 # ModelBackend ABC + TransformersBackend
-  kv.py                    # DynamicCache, TTQ compression, serialization
+  agent.py                 # ReAct agent loop, sampling, tool dispatch
+  model.py                 # ModelBackend ABC + TransformersBackend + symmetric TTQ
+  kv.py                    # DynamicCache, TTQ compression, multihead, serialization
   tools/
     __init__.py
     search.py              # SearXNG web search
@@ -213,7 +241,7 @@ ghostkv/
     error.j2               # Tool error formatting
 
 tests/
-  test_ghostkv.py          # 66 tests covering all components
+  test_ghostkv.py          # 75 tests covering all components
 ```
 
 ### Model Backend
@@ -229,7 +257,7 @@ class ModelBackend(ABC):
     def head_dim(self) -> int
 ```
 
-**TransformersBackend** — loads HF models with BitsAndBytes NF4 quantization. Uses `model.forward()` directly (not `model.generate()`) for full KV cache control with DynamicCache.
+**TransformersBackend** — loads HF models with BitsAndBytes NF4 quantization. Uses `model.forward()` directly (not `model.generate()`) for full KV cache control with DynamicCache. Supports `install_symmetric_ttq()` for inline Q/K/V compression.
 
 ### KV Compression (TTQ)
 
@@ -240,6 +268,15 @@ Training-free KV cache compression adapted from TurboQuant:
 3. **Derotate** — rotate back to original coordinate frame
 
 This is the same pipeline proven in Stages 5-7 of the ResolutionRouter research, inlined here with no external dependencies.
+
+### Symmetric TTQ
+
+Extends TTQ to compress Q alongside K/V during the forward pass:
+
+1. Monkey-patches Q/K/V projection layers on all attention heads
+2. Each projection output: split into per-head chunks → rotate → quantize → derotate
+3. All three use the same rotation matrix — quantization noise cancels in Q·K^T
+4. Uses monkey-patching (not `register_forward_hook`) — hooks segfault on BitsAndBytes layers
 
 ### Serialization
 
@@ -266,6 +303,8 @@ Question
     ↓
 [Forward pass with past KV → response]
     ↓
+[Sample next token: temperature + top-k + top-p]
+    ↓
 [Parse response for Action: tool_name(args)]
     ↓ yes                      ↓ no
 [Execute tool]              [Final answer]
@@ -280,12 +319,12 @@ The key: observations are fed as **new tokens only**. The model's past context i
 
 ## Test Suite
 
-66 tests covering every component without requiring a GPU:
+75 tests covering every component without requiring a GPU:
 
 ```
 $ python -m pytest tests/ -v
 
-KV Compression ............ 8 passed  (orthogonal, shapes, 4-bit > 3-bit, round-trip)
+KV Compression ............ 11 passed (orthogonal, shapes, 4-bit > 3-bit, round-trip, multihead)
 KV Serialization .......... 5 passed  (round-trip, empty, single, large, fp16)
 KV Session ................ 9 passed  (save/load, reset, stats, log, size)
 Search Tool ............... 2 passed  (instantiation, offline error)
@@ -295,11 +334,12 @@ HTTP Tool ................. 3 passed  (instantiation, no URL, offline error)
 Memory Tool ............... 8 passed  (write/recall, frontmatter, ranking, wikilinks)
 Tool Dispatch ............. 10 passed (regex parsing, dispatch, available tools)
 Generate Step ............. 1 passed  (mock model autoregressive)
+Sampling .................. 7 passed  (greedy, temperature, top-k, top-p, integration)
 Agent ReAct ............... 2 passed  (multiline regex, tag extraction)
 Templates ................. 4 passed  (system, observe, memory, error)
 Integration ............... 2 passed  (full pipeline, compress→serialize→restore)
                                    ---
-                              66 passed
+                              75 passed
 ```
 
 ## Dependencies
@@ -323,6 +363,17 @@ Built on research from the ResolutionRouter project (Stages 7a-7e):
 | Symmetric TTQ | Stage 7e | Q/K/V same-frame rotation for noise cancellation |
 | head_dim fix | Stage 7e | `getattr(config, "head_dim", hidden_size // heads)` |
 | DynamicCache API | Stage 7c | `list(cache) → (K,V,extra)`, `cache.update(k,v,layer_idx)` |
+
+## Changelog
+
+### v0.2.0
+- **Sampling**: temperature + top-k + top-p (nucleus) sampling replaces greedy argmax. Varied, non-repetitive output. `--temperature`, `--top-k`, `--top-p` CLI flags.
+- **Symmetric TTQ**: inline Q/K/V compression during the forward pass. All three projections share the same rotation matrix for symmetric noise cancellation in Q·K^T. `--symmetric-ttq` and `--query-bits` CLI flags.
+- **Multihead compression**: `compress_tensor_multihead()` splits projection outputs into per-head chunks for correct TTQ on multi-head attention.
+- **9 new tests** (66 → 75).
+
+### v0.1.0
+- Initial release: ReAct loop, KV-state persistence, TTQ compression, Obsidian vault memory, 6 tools, 66 tests.
 
 ## License
 

@@ -105,6 +105,32 @@ class TestKVCompression:
             assert orig_layers[i][0].shape == comp_layers[i][0].shape
             assert orig_layers[i][1].shape == comp_layers[i][1].shape
 
+    def test_compress_tensor_multihead_shape(self):
+        """Multi-head compression preserves shape of projection output."""
+        from ghostkv.kv import compress_tensor_multihead, random_orthogonal
+        R = random_orthogonal(32)
+        # Simulate a projection output: (batch=1, seq=10, num_heads * head_dim = 4 * 32 = 128)
+        x = torch.randn(1, 10, 128)
+        out = compress_tensor_multihead(x, R, head_dim=32, bits=3)
+        assert out.shape == x.shape
+
+    def test_compress_tensor_multihead_dtype(self):
+        from ghostkv.kv import compress_tensor_multihead, random_orthogonal
+        R = random_orthogonal(16)
+        x = torch.randn(2, 5, 64, dtype=torch.float32)
+        out = compress_tensor_multihead(x, R, head_dim=16, bits=3)
+        assert out.dtype == x.dtype
+
+    def test_compress_tensor_multihead_4bit_better_than_3bit(self):
+        from ghostkv.kv import compress_tensor_multihead, random_orthogonal
+        R = random_orthogonal(32)
+        x = torch.randn(1, 20, 128)
+        out_3 = compress_tensor_multihead(x, R, head_dim=32, bits=3)
+        out_4 = compress_tensor_multihead(x, R, head_dim=32, bits=4)
+        err_3 = (x.float() - out_3.float()).norm().item()
+        err_4 = (x.float() - out_4.float()).norm().item()
+        assert err_4 < err_3
+
 
 class TestKVSerialization:
     """Test serialize/deserialize round-trip with zlib binary format."""
@@ -715,6 +741,95 @@ class TestGenerateStep:
         assert len(gen_ids) == 5  # 4 tokens of 42 + 1 EOS
         assert all(t == 42 for t in gen_ids[:4])
         assert gen_ids[4] == 999  # EOS
+
+
+class TestSampling:
+    """Test sample_token with temperature, top-k, top-p."""
+
+    def test_greedy_equals_argmax(self):
+        """temperature=0 should return argmax (deterministic)."""
+        from ghostkv.agent import sample_token
+        logits = torch.tensor([[1.0, 5.0, 3.0, 0.5]])
+        tok = sample_token(logits, temperature=0)
+        assert tok.item() == 1  # index of max
+
+    def test_temperature_scaling(self):
+        """Higher temperature flattens distribution — less concentrated on max."""
+        from ghostkv.agent import sample_token
+        logits = torch.tensor([[0.0, 10.0, 0.0, 0.0]])
+        # Low temp: almost always picks index 1
+        torch.manual_seed(42)
+        counts = sum(sample_token(logits, temperature=0.01).item() == 1 for _ in range(20))
+        assert counts >= 18  # almost always 1
+
+    def test_top_k_filters(self):
+        """top_k=2 should only sample from top 2 tokens."""
+        from ghostkv.agent import sample_token
+        logits = torch.tensor([[1.0, 5.0, 3.0, 0.5]])
+        # top_k=2: indices 1 (5.0) and 2 (3.0)
+        torch.manual_seed(0)
+        for _ in range(50):
+            tok = sample_token(logits, temperature=1.0, top_k=2, top_p=1.0)
+            assert tok.item() in (1, 2)
+
+    def test_top_p_nucleus(self):
+        """top_p should keep smallest set exceeding threshold."""
+        from ghostkv.agent import sample_token
+        # Logits: [1, 10, 1, 1] — index 1 dominates
+        logits = torch.tensor([[1.0, 10.0, 1.0, 1.0]])
+        torch.manual_seed(0)
+        counts = sum(sample_token(logits, temperature=1.0, top_k=0, top_p=0.5).item() == 1
+                     for _ in range(50))
+        assert counts >= 40  # index 1 should dominate
+
+    def test_top_p_1_no_filtering(self):
+        """top_p=1.0 should not filter anything."""
+        from ghostkv.agent import sample_token
+        logits = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+        seen = set()
+        torch.manual_seed(42)
+        for _ in range(100):
+            tok = sample_token(logits, temperature=2.0, top_k=0, top_p=1.0)
+            seen.add(tok.item())
+        # With high temp and no filtering, should see multiple tokens
+        assert len(seen) >= 2
+
+    def test_sampling_with_generate_step(self):
+        """generate_step with sampling should still terminate on EOS."""
+        from ghostkv.agent import generate_step
+        from ghostkv.model import ModelBackend
+
+        class MockModel(ModelBackend):
+            def __init__(self):
+                self._eos = 999
+                self._count = 0
+
+            def forward(self, input_ids, past_kv=None, use_cache=True):
+                self._count += 1
+                vocab_size = 1000
+                logits = torch.zeros(1, input_ids.shape[1], vocab_size)
+                if self._count < 4:
+                    logits[:, -1, 42] = 100.0
+                    logits[:, -1, 7] = 90.0  # second choice
+                else:
+                    logits[:, -1, self._eos] = 100.0
+                cache = DynamicCache() if past_kv is None else past_kv
+                return logits, cache
+
+            def tokenize(self, text, **kwargs): return torch.tensor([[1]])
+            def decode(self, ids): return "text"
+            @property
+            def head_dim(self): return 8
+            @property
+            def device(self): return "cpu"
+            @property
+            def eos_token_id(self): return self._eos
+
+        mock = MockModel()
+        ids, _ = generate_step(mock, torch.tensor([[1]]), max_new=20,
+                               temperature=0.8, top_k=50, top_p=0.9)
+        assert len(ids) == 4
+        assert ids[-1] == 999
 
 
 class TestAgentReAct:

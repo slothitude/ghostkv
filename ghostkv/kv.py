@@ -79,6 +79,29 @@ def compress_kv_cache(
     return new_cache
 
 
+def compress_tensor_multihead(
+    x: torch.Tensor,
+    rotation: torch.Tensor,
+    head_dim: int,
+    bits: int = 3,
+) -> torch.Tensor:
+    """Compress a multi-head projection output (batch, seq, num_heads * head_dim).
+
+    Splits into per-head chunks, compresses each, and concatenates back.
+    Used for symmetric TTQ on Q/K/V projection outputs.
+    """
+    orig_shape = x.shape
+    flat = x.float().reshape(-1, orig_shape[-1])
+    n_chunks = orig_shape[-1] // head_dim
+    chunks = []
+    for c in range(n_chunks):
+        chunk = flat[:, c * head_dim:(c + 1) * head_dim]
+        compressed = compress_tensor(chunk, rotation, bits)
+        chunks.append(compressed)
+    result = torch.cat(chunks, dim=-1)
+    return result.reshape(orig_shape).to(x.dtype)
+
+
 # ---------------------------------------------------------------------------
 # Serialization (from Stage 7c — zlib binary format)
 # ---------------------------------------------------------------------------

@@ -5,6 +5,12 @@ Currently supports TransformersBackend (HF models with BitsAndBytes).
 
 The key method is forward() which returns (logits, new_kv) — compatible
 with DynamicCache for KV-state persistence across steps.
+
+Symmetric TTQ: monkey-patches Q/K/V projection layers to apply rotate→quantize→derotate
+inline during the forward pass. All three projections share the same rotation matrix,
+so quantization noise becomes symmetric in the attention dot product Q·K^T and partially
+cancels. Uses monkey-patching (not register_forward_hook) because hooks segfault on
+BitsAndBytes Linear4bit layers.
 """
 
 from __future__ import annotations
@@ -163,3 +169,77 @@ class TransformersBackend(ModelBackend):
     @property
     def eos_token_id(self) -> int:
         return self._eos_id
+
+    # ------------------------------------------------------------------
+    # Symmetric TTQ — inline Q/K/V compression during forward pass
+    # ------------------------------------------------------------------
+
+    def _find_attn_layers(self) -> list[tuple[str, object]]:
+        """Find all attention layers with separate q_proj/k_proj/v_proj."""
+        layers = []
+        for name, module in self.model.named_modules():
+            cls_name = type(module).__name__.lower()
+            if ("attention" in cls_name or "attn" in cls_name) and hasattr(module, "q_proj"):
+                layers.append((name, module))
+        return layers
+
+    def install_symmetric_ttq(
+        self,
+        rotation: torch.Tensor,
+        k_bits: int = 3,
+        v_bits: int = 3,
+        q_bits: int = 4,
+    ) -> bool:
+        """Install symmetric TTQ monkey patches on Q/K/V projections.
+
+        All three projections (Q, K, V) get rotate→quantize→derotate using
+        the same rotation matrix. Quantization noise becomes symmetric in
+        Q·K^T and partially cancels.
+
+        Args:
+            rotation: (head_dim, head_dim) orthogonal matrix (from KVSession)
+            k_bits: Key quantization bits
+            v_bits: Value quantization bits
+            q_bits: Query quantization bits
+
+        Returns:
+            True if patches were installed, False if no attention layers found.
+        """
+        from ghostkv.kv import compress_tensor_multihead
+
+        self._ttq_originals = []
+        head_dim = self._head_dim
+        attn_layers = self._find_attn_layers()
+
+        if not attn_layers:
+            logger.warning("No attention layers found for symmetric TTQ")
+            return False
+
+        rotation = rotation.to(self._device)
+
+        for _name, module in attn_layers:
+            for proj_name, bits in [("q_proj", q_bits), ("k_proj", k_bits), ("v_proj", v_bits)]:
+                proj = getattr(module, proj_name)
+                orig_fwd = proj.forward
+                self._ttq_originals.append((module, proj_name, orig_fwd))
+
+                def make_patched(original_forward, rot, hd, b):
+                    def patched_forward(self_mod, *args, **kwargs):
+                        out = original_forward(self_mod, *args, **kwargs)
+                        return compress_tensor_multihead(out, rot, hd, b)
+                    return patched_forward
+
+                proj.forward = make_patched(orig_fwd, rotation, head_dim, bits)
+
+        logger.info(f"Symmetric TTQ installed: {len(attn_layers)} layers, "
+                     f"K={k_bits}b V={v_bits}b Q={q_bits}b")
+        return True
+
+    def remove_symmetric_ttq(self):
+        """Remove symmetric TTQ patches, restore original forward methods."""
+        if not hasattr(self, '_ttq_originals') or not self._ttq_originals:
+            return
+        for module, proj_name, orig_fwd in self._ttq_originals:
+            getattr(module, proj_name).forward = orig_fwd
+        self._ttq_originals.clear()
+        logger.info("Symmetric TTQ removed")

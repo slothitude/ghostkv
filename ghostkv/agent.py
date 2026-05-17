@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Optional
 
 import torch
+from torch.nn import functional as F
 from jinja2 import Environment, FileSystemLoader
 
 from ghostkv.kv import KVSession
@@ -113,6 +114,55 @@ class ToolDispatch:
 
 
 # ---------------------------------------------------------------------------
+# Sampling — temperature, top-k, top-p (nucleus)
+# ---------------------------------------------------------------------------
+
+def sample_token(
+    logits: torch.Tensor,
+    temperature: float = 0.8,
+    top_k: int = 50,
+    top_p: float = 0.9,
+) -> torch.Tensor:
+    """Sample next token with temperature, top-k, and nucleus (top-p) filtering.
+
+    Args:
+        logits: (batch, vocab_size) raw logits for next position
+        temperature: Sampling temperature (>0). Lower = more deterministic.
+        top_k: Keep only top-k highest probability tokens. 0 = disabled.
+        top_p: Keep smallest set of tokens with cumulative prob >= top_p. 1.0 = disabled.
+
+    Returns:
+        (batch, 1) sampled token IDs
+    """
+    if temperature <= 0:
+        return logits.argmax(dim=-1, keepdim=True)
+
+    logits = logits / temperature
+
+    # Top-k filtering
+    if top_k > 0:
+        k = min(top_k, logits.size(-1))
+        topk_vals, _ = torch.topk(logits, k, dim=-1)
+        threshold = topk_vals[:, -1:]
+        logits = logits.masked_fill(logits < threshold, float('-inf'))
+
+    # Top-p (nucleus) filtering
+    if top_p < 1.0:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+        # Mask tokens above cumulative threshold (keep first that exceeds)
+        sorted_mask = cumulative_probs > top_p
+        sorted_mask[..., 1:] = sorted_mask[..., :-1].clone()
+        sorted_mask[..., 0] = False
+        # Scatter back to original ordering
+        mask = sorted_mask.scatter(1, sorted_indices, sorted_mask)
+        logits = logits.masked_fill(mask, float('-inf'))
+
+    probs = F.softmax(logits, dim=-1)
+    return torch.multinomial(probs, num_samples=1)
+
+
+# ---------------------------------------------------------------------------
 # Manual autoregressive generation (from Stage 7a)
 # ---------------------------------------------------------------------------
 
@@ -121,6 +171,9 @@ def generate_step(
     input_ids: torch.Tensor,
     past_kv=None,
     max_new: int = 120,
+    temperature: float = 0.8,
+    top_k: int = 50,
+    top_p: float = 0.9,
 ) -> tuple[list[int], object]:
     """Generate tokens one at a time using model.forward().
 
@@ -133,7 +186,7 @@ def generate_step(
     for _ in range(max_new):
         logits, pkv = model.forward(current_ids, past_kv=pkv, use_cache=True)
         next_logits = logits[:, -1, :]
-        next_token = next_logits.argmax(dim=-1, keepdim=True)
+        next_token = sample_token(next_logits, temperature, top_k, top_p)
         tid = next_token.item()
         generated.append(tid)
         current_ids = next_token
@@ -170,6 +223,9 @@ class GhostKVAgent:
         max_new_tokens: int = 120,
         max_steps: int = 10,
         auto_save_steps: int = 5,
+        temperature: float = 0.8,
+        top_k: int = 50,
+        top_p: float = 0.9,
     ):
         self.model = model
         self.session = session
@@ -178,6 +234,9 @@ class GhostKVAgent:
         self.max_new_tokens = max_new_tokens
         self.max_steps = max_steps
         self.auto_save_steps = auto_save_steps
+        self.temperature = temperature
+        self.top_k = top_k
+        self.top_p = top_p
 
         # Load templates
         template_dir = Path(__file__).parent / "templates"
@@ -228,6 +287,9 @@ class GhostKVAgent:
             self.model, input_ids,
             past_kv=self.session.cache,
             max_new=self.max_new_tokens,
+            temperature=self.temperature,
+            top_k=self.top_k,
+            top_p=self.top_p,
         )
         response = self.model.decode(gen_ids)
 
@@ -291,6 +353,9 @@ class GhostKVAgent:
                 self.model, obs_ids,
                 past_kv=self.session.cache,
                 max_new=self.max_new_tokens,
+                temperature=self.temperature,
+                top_k=self.top_k,
+                top_p=self.top_p,
             )
 
             self.session.cache = new_kv
