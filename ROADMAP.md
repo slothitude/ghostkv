@@ -4,11 +4,11 @@
 
 Every major competitor (Claude Code, Goose, OpenCode) supports the Model Context Protocol. Without it, GhostKV can't connect to external tool servers.
 
-- [ ] Add MCP client to `ghostkv/mcp.py` — discover tools from MCP servers via stdio/SSE transport
-- [ ] Merge MCP tools into `ToolDispatch` alongside built-in tools
-- [ ] `--mcp` CLI flag to specify MCP server URLs (repeatable)
-- [ ] MCP tool schemas auto-converted to `Action: tool_name(args)` format for local model
-- [ ] Tests with mock MCP server
+- [x] Add MCP client to `ghostkv/mcp.py` — discover tools from MCP servers via stdio/SSE transport
+- [x] Merge MCP tools into `ToolDispatch` alongside built-in tools
+- [x] `--mcp` CLI flag to specify MCP server URLs (repeatable)
+- [x] MCP tool schemas auto-converted to `Action: tool_name(args)` format for local model
+- [x] Tests with mock MCP server
 
 ## v0.6.0 — Tree-sitter Repo Map (Aider Pattern)
 
@@ -66,3 +66,18 @@ GhostKV generates tokens silently then shows the result. Every competitor stream
 - [ ] **Adaptive routing** — classify question complexity locally, skip remote call for easy questions (pure local), escalate for hard ones
 - [ ] **Cartridge pre-training** — learn compressed KV representations offline from documentation, load as "knowledge" at runtime
 - [ ] **Context window overflow** — when KV exceeds model's max position embeddings, compress older layers more aggressively (PyramidKV pattern)
+
+## v1.1.0 — Godot 4.6 Desktop GUI (GhostKV Desktop)
+
+A native desktop application built with Godot 4.6 — the Claude Desktop of local KV-state agents. Full chat interface, real-time tool visualization, KV state inspector, and MCP server management.
+
+- [ ] Chat UI — message bubbles with streaming output, markdown rendering, code syntax highlighting
+- [ ] Tool call visualization — expandable cards showing Action → tool args → result for each ReAct step
+- [ ] KV state display — real-time visualization of KV cache size, compression ratio, token count, session history
+- [ ] MCP server management panel — add/remove MCP servers (stdio/SSE), see connected tools, test tool calls
+- [ ] Session manager — switch between sessions, see session stats, create/delete sessions
+- [ ] Memory vault browser — tree view of vault files, search, preview markdown
+- [ ] Settings panel — model path, temperature/top-k/top-p sliders, remote API config, KV compression bits
+- [ ] System tray integration — minimize to tray, global hotkey to show/hide
+- [ ] Platform: Windows (primary), Linux, macOS via Godot export templates
+- [ ] Communication: GDScript → Python subprocess (ghostkv CLI in `--json` mode) or embedded Python via GDExtension

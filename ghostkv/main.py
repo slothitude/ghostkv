@@ -121,7 +121,7 @@ def build_agent(args: argparse.Namespace) -> GhostKVAgent:
         )
 
         print(f"Hybrid mode: local={Path(args.model).name} + remote={args.remote_model} @ {args.remote}")
-        return agent
+        return _attach_mcp(agent, args)
 
     if args.remote:
         # Remote mode — no GPU, no local model
@@ -160,7 +160,7 @@ def build_agent(args: argparse.Namespace) -> GhostKVAgent:
         )
 
         print(f"Remote mode: {args.remote_model} @ {args.remote}")
-        return agent
+        return _attach_mcp(agent, args)
 
     # Local mode — existing path
     print(f"Loading model from {args.model}...")
@@ -211,6 +211,32 @@ def build_agent(args: argparse.Namespace) -> GhostKVAgent:
         top_p=args.top_p,
     )
 
+    return _attach_mcp(agent, args)
+
+
+def _attach_mcp(agent: GhostKVAgent, args: argparse.Namespace) -> GhostKVAgent:
+    """Connect to MCP servers and register discovered tools."""
+    if not args.mcp:
+        return agent
+
+    from ghostkv.mcp import MCPClientManager
+    mgr = MCPClientManager()
+
+    # Pair --mcp-args with --mcp specs
+    mcp_args_list = args.mcp_args or []
+    for i, spec in enumerate(args.mcp):
+        server_args = mcp_args_list[i].split() if i < len(mcp_args_list) else None
+        try:
+            mgr.connect(spec, args=server_args)
+        except Exception as e:
+            print(f"MCP warning: failed to connect to {spec}: {e}")
+
+    mcp_tools = mgr.discover_all()
+    for tool_info in mcp_tools:
+        agent.tools.register_tool(tool_info["name"], tool_info["tool"])
+
+    print(f"MCP: {len(mcp_tools)} tools from {len(args.mcp)} server(s)")
+    agent._mcp_manager = mgr
     return agent
 
 
@@ -390,6 +416,11 @@ def main():
                         help="Remote API request timeout in seconds (default: 120)")
     parser.add_argument("--hybrid", action="store_true",
                         help="Hybrid mode: local model for ReAct + remote for final synthesis")
+    # MCP server flags
+    parser.add_argument("--mcp", action="append", default=[],
+                        help="MCP server to connect to (repeatable). Format: stdio:command or sse:url")
+    parser.add_argument("--mcp-args", action="append", default=[],
+                        help="Arguments for the corresponding --mcp stdio server")
     args = parser.parse_args()
 
     logging.basicConfig(level=getattr(logging, args.log_level), format="%(name)s: %(message)s")

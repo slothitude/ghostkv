@@ -87,6 +87,10 @@ class ToolDispatch:
         if memory:
             self._tools["recall"] = memory
 
+    def register_tool(self, name: str, tool: object) -> None:
+        """Register a tool dynamically (for MCP tools)."""
+        self._tools[name] = tool
+
     def available_tools(self) -> list[str]:
         return list(self._tools.keys())
 
@@ -129,7 +133,11 @@ class ToolDispatch:
             elif tool_name == "recall":
                 result = tool.run(arg1)
             else:
-                result = f"Tool '{tool_name}' not implemented"
+                # Generic tool call (MCP tools)
+                try:
+                    result = tool.run(query=arg1)
+                except Exception as e:
+                    result = f"Tool error ({tool_name}): {e}"
         except Exception as e:
             result = f"Tool error ({tool_name}): {e}"
 
@@ -286,8 +294,19 @@ class GhostKVAgent:
 
     def _build_initial_prompt(self, question: str) -> str:
         """Build the first prompt with system instructions + question."""
+        # Collect MCP tool info for template
+        mcp_tools = []
+        for name, tool in self.tools._tools.items():
+            if hasattr(tool, "input_schema"):
+                mcp_tools.append({
+                    "name": name,
+                    "params": tool.params if hasattr(tool, "params") else "",
+                    "description": tool.description if hasattr(tool, "description") else "",
+                })
+
         system = self.system_template.render(
-            tools=", ".join(self.tools.available_tools())
+            tools=", ".join(self.tools.available_tools()),
+            mcp_tools=mcp_tools if mcp_tools else None,
         )
         return f"{system}\n\nQuestion: {question}\n"
 
